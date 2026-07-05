@@ -1,0 +1,831 @@
+diff --git a/arch/arm64/configs/gki_defconfig b/arch/arm64/configs/gki_defconfig
+index 8438ae2ea..9fe65ba6e 100644
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -719,6 +719,10 @@ CONFIG_WQ_WATCHDOG=y
+ CONFIG_SCHEDSTATS=y
+ CONFIG_BUG_ON_DATA_CORRUPTION=y
+ CONFIG_HIST_TRIGGERS=y
+ CONFIG_PID_IN_CONTEXTIDR=y
+ CONFIG_FUNCTION_ERROR_INJECTION=y
+ # CONFIG_RUNTIME_TESTING_MENU is not set
++CONFIG_ABORT_MM_OPT=y
++CONFIG_KSHRINK_LRUVECD=y
++CONFIG_KSHRINK_SLABD=y
++CONFIG_PCPPAGES_OPT=y
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 9d982e52c..382141de4 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -978,3 +978,5 @@ config SPECULATIVE_PAGE_FAULT
+ 	  processing using the mmap read lock.
+ 
+ endmenu
++
++source "mm/async_reclaim_opt/Kconfig"
+diff --git a/mm/Makefile b/mm/Makefile
+index 0d74b5aa7..9e7efda4f 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -110,6 +110,7 @@ obj-$(CONFIG_ZBUD)	+= zbud.o
+ obj-$(CONFIG_ZSMALLOC)	+= zsmalloc.o
+ obj-$(CONFIG_Z3FOLD)	+= z3fold.o
+ obj-$(CONFIG_GENERIC_EARLY_IOREMAP) += early_ioremap.o
++obj-y			+= async_reclaim_opt/
+ obj-$(CONFIG_CMA)	+= cma.o
+ obj-$(CONFIG_MEMORY_BALLOON) += balloon_compaction.o
+ obj-$(CONFIG_PAGE_EXTENSION) += page_ext.o
+diff --git a/mm/async_reclaim_opt/Kconfig b/mm/async_reclaim_opt/Kconfig
+new file mode 100644
+index 000000000..af4a7f630
+--- /dev/null
++++ b/mm/async_reclaim_opt/Kconfig
+@@ -0,0 +1,28 @@
++menu "Async reclaim optimizations"
++
++config ABORT_MM_OPT
++	tristate "Abort madvise/compact on SIGUSR2"
++	help
++	  Aborts long madvise cold/pageout and compaction work when the current
++	  task receives SIGUSR2.
++
++config KSHRINK_LRUVECD
++	tristate "Async lruvec reclaim helper"
++	depends on MMU
++	help
++	  Collects pages that failed page_trylock during reclaim and reclaims them
++	  asynchronously from a dedicated kernel thread.
++
++config KSHRINK_SLABD
++	tristate "Async slab shrink helper"
++	depends on MEMCG
++	help
++	  Offloads shrink_slab() from direct reclaim into a dedicated kernel thread.
++
++config PCPPAGES_OPT
++	tristate "Bypass drain_all_pages in reclaim path"
++	help
++	  Bypasses the global per-cpu page drain hook. This reduces latency but may
++	  trade off reclaim aggressiveness in some workloads.
++
++endmenu
+diff --git a/mm/async_reclaim_opt/Makefile b/mm/async_reclaim_opt/Makefile
+new file mode 100644
+index 000000000..7b98a9665
+--- /dev/null
++++ b/mm/async_reclaim_opt/Makefile
+@@ -0,0 +1,4 @@
++obj-$(CONFIG_ABORT_MM_OPT) += abort_mm_opt.o
++obj-$(CONFIG_KSHRINK_LRUVECD) += kshrink_lruvecd.o
++obj-$(CONFIG_KSHRINK_SLABD) += kshrink_slabd.o
++obj-$(CONFIG_PCPPAGES_OPT) += pcppages_opt.o
+diff --git a/mm/async_reclaim_opt/abort_mm_opt.c b/mm/async_reclaim_opt/abort_mm_opt.c
+new file mode 100644
+index 000000000..296bdb847
+--- /dev/null
++++ b/mm/async_reclaim_opt/abort_mm_opt.c
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2020-2023 Oplus. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "abort_mm_opt: " fmt
++
++#include <linux/module.h>
++#include <trace/hooks/vmscan.h>
++#include <trace/hooks/mm.h>
++#include <linux/swap.h>
++#include <linux/proc_fs.h>
++#include <linux/gfp.h>
++#include <linux/types.h>
++#include <linux/printk.h>
++
++static void should_abort_madvise(void *data, struct vm_area_struct *vma, bool *abort_madvise)
++{
++	if (unlikely(task_sigpending(current) &&
++		sigismember(&current->pending.signal, SIGUSR2)))
++		*abort_madvise = true;
++}
++
++static void should_abort_compact(void *data, bool *abort_compact)
++{
++	if (unlikely(task_sigpending(current) &&
++		sigismember(&current->pending.signal, SIGUSR2)))
++		*abort_compact = true;
++}
++
++static int register_abort_mm_opt_vendor_hooks(void)
++{
++	int ret = 0;
++
++	ret = register_trace_android_vh_madvise_cold_or_pageout_abort(should_abort_madvise, NULL);
++	if (ret != 0) {
++		pr_err("register_trace_android_vh_madvise_cold_or_pageout_abort failed! ret=%d\n", ret);
++		goto out;
++	}
++
++	ret = register_trace_android_vh_compact_finished(should_abort_compact, NULL);
++	if (ret != 0) {
++		unregister_trace_android_vh_madvise_cold_or_pageout_abort(should_abort_madvise, NULL);
++		pr_err("register_trace_android_vh_compact_finished failed! ret=%d\n", ret);
++		goto out;
++	}
++
++out:
++	return ret;
++}
++
++static void unregister_abort_mm_opt_vendor_hooks(void)
++{
++	unregister_trace_android_vh_compact_finished(should_abort_compact, NULL);
++	unregister_trace_android_vh_madvise_cold_or_pageout_abort(should_abort_madvise, NULL);
++
++	return;
++}
++
++static int __init abort_mm_opt_init(void)
++{
++	int ret = 0;
++
++	ret = register_abort_mm_opt_vendor_hooks();
++	if (ret != 0)
++		return ret;
++
++	pr_info("abort_mm_opt_init succeed!\n");
++	return 0;
++}
++
++static void __exit abort_mm_opt_exit(void)
++{
++	unregister_abort_mm_opt_vendor_hooks();
++
++	pr_info("abort_mm_opt_exit exit succeed!\n");
++
++	return;
++}
++
++module_init(abort_mm_opt_init);
++module_exit(abort_mm_opt_exit);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/mm/async_reclaim_opt/kshrink_lruvecd.c b/mm/async_reclaim_opt/kshrink_lruvecd.c
+new file mode 100644
+index 000000000..108becc1e
+--- /dev/null
++++ b/mm/async_reclaim_opt/kshrink_lruvecd.c
+@@ -0,0 +1,326 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
++ */
++
++#include <linux/module.h>
++#include <linux/oom.h>
++#include <trace/hooks/mm.h>
++#include <trace/hooks/signal.h>
++#include <trace/hooks/vmscan.h>
++#include <linux/printk.h>
++#include <linux/dma-mapping.h>
++#include <linux/dma-direct.h>
++
++#include <trace/hooks/vmscan.h>
++
++#include <linux/mm.h>
++#include <linux/gfp.h>
++#include <linux/swap.h>
++#include <linux/pagemap.h>
++#include <linux/init.h>
++#include <linux/highmem.h>
++#include <linux/vmstat.h>
++#include <linux/mm_inline.h>
++#include <linux/rmap.h>
++#include <linux/rwsem.h>
++#include <linux/delay.h>
++#include <linux/kthread.h>
++#include <linux/freezer.h>
++#include <linux/memcontrol.h>
++#include <linux/psi.h>
++#include <linux/proc_fs.h>
++#include <linux/cpufreq.h>
++#include <linux/vmstat.h>
++
++#include "../internal.h"
++#define SHRINK_LRUVECD_HIGH (0x1000)  //16Mbytes
++
++#define PG_nolockdelay (__NR_PAGEFLAGS + 2)
++#define SetPageNoLockDelay(page) set_bit(PG_nolockdelay, &(page)->flags)
++#define TestPageNoLockDelay(page) test_bit(PG_nolockdelay, &(page)->flags)
++#define TestClearPageNoLockDelay(page) test_and_clear_bit(PG_nolockdelay, &(page)->flags)
++#define ClearPageNoLockDelay(page) clear_bit(PG_nolockdelay, &(page)->flags)
++
++#define PG_skiped_lock (__NR_PAGEFLAGS + 3)
++#define SetPageSkipedLock(page) set_bit(PG_skiped_lock, &(page)->flags)
++#define ClearPageSkipedLock(page) clear_bit(PG_skiped_lock, &(page)->flags)
++#define PageSkipedLock(page) test_bit(PG_skiped_lock, &(page)->flags)
++#define TestClearPageSkipedLock(page) test_and_clear_bit(PG_skiped_lock, &(page)->flags)
++
++extern unsigned long reclaim_pages(struct list_head *page_list);
++bool async_shrink_lruvec_setup = false;
++static struct task_struct *shrink_lruvec_tsk = NULL;
++static atomic_t shrink_lruvec_runnable = ATOMIC_INIT(0);
++unsigned long shrink_lruvec_pages = 0;
++unsigned long shrink_lruvec_pages_max = 0;
++unsigned long shrink_lruvec_handle_pages = 0;
++wait_queue_head_t shrink_lruvec_wait;
++spinlock_t l_inactive_lock;
++LIST_HEAD(lru_inactive);
++
++static bool process_is_shrink_lruvecd(struct task_struct *tsk)
++{
++	return (shrink_lruvec_tsk->pid == tsk->pid);
++}
++
++static void add_to_lruvecd_inactive_list(struct page *page)
++{
++	list_move(&page->lru, &lru_inactive);
++
++	/* account how much pages in lru_inactive */
++	shrink_lruvec_pages += thp_nr_pages(page);
++	if (shrink_lruvec_pages > shrink_lruvec_pages_max)
++		shrink_lruvec_pages_max = shrink_lruvec_pages;
++}
++
++static void handle_failed_page_trylock(void *data, struct list_head *page_list)
++{
++	struct page *page, *next;
++	bool shrink_lruvecd_is_full = false;
++	bool pages_should_be_reclaim = false;
++	LIST_HEAD(tmp_lru_inactive);
++
++	if (unlikely(!async_shrink_lruvec_setup))
++		return;
++
++	if (list_empty(page_list))
++		return;
++
++	if (unlikely(shrink_lruvec_pages > SHRINK_LRUVECD_HIGH))
++		shrink_lruvecd_is_full = true;
++
++	list_for_each_entry_safe(page, next, page_list, lru) {
++		ClearPageNoLockDelay(page);
++		if (unlikely(TestClearPageSkipedLock(page))) {
++			/* trylock failed and been skiped  */
++			ClearPageActive(page);
++			if (!shrink_lruvecd_is_full)
++				list_move(&page->lru, &tmp_lru_inactive);
++		}
++	}
++
++	if (unlikely(!list_empty(&tmp_lru_inactive))) {
++		spin_lock_irq(&l_inactive_lock);
++		list_for_each_entry_safe(page, next, &tmp_lru_inactive, lru) {
++			if (likely(!shrink_lruvecd_is_full)) {
++				pages_should_be_reclaim = true;
++				add_to_lruvecd_inactive_list(page);
++			}
++		}
++		spin_unlock_irq(&l_inactive_lock);
++	}
++
++	if (shrink_lruvecd_is_full || !pages_should_be_reclaim)
++		return;
++
++	if (atomic_read(&shrink_lruvec_runnable) == 1)
++		return;
++
++	atomic_set(&shrink_lruvec_runnable, 1);
++	wake_up_interruptible(&shrink_lruvec_wait);
++}
++
++void set_shrink_lruvecd_cpus(void)
++{
++	struct cpumask mask;
++	struct cpumask *cpumask = &mask;
++	pg_data_t *pgdat = NODE_DATA(0);
++	unsigned int cpu = 0, cpufreq_max_tmp = 0;
++	struct cpufreq_policy *policy_max;
++	static bool set_slabd_cpus_success = false;
++
++	if (unlikely(!async_shrink_lruvec_setup))
++		return;
++
++	if (likely(set_slabd_cpus_success))
++		return;
++
++	for_each_possible_cpu(cpu) {
++		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++
++		if (policy == NULL)
++			continue;
++
++		if (policy->cpuinfo.max_freq >= cpufreq_max_tmp) {
++			cpufreq_max_tmp = policy->cpuinfo.max_freq;
++			policy_max = policy;
++		}
++	}
++
++	cpumask_copy(cpumask, cpumask_of_node(pgdat->node_id));
++	cpumask_andnot(cpumask, cpumask, policy_max->related_cpus);
++
++	if (!cpumask_empty(cpumask)) {
++		set_cpus_allowed_ptr(shrink_lruvec_tsk, cpumask);
++		set_slabd_cpus_success = true;
++	}
++}
++
++static int shrink_lruvecd(void *p)
++{
++	pg_data_t *pgdat;
++	LIST_HEAD(tmp_lru_inactive);
++	struct page *page, *next;
++	struct list_head;
++
++	/*
++	 * Tell the memory management that we're a "memory allocator",
++	 * and that if we need more memory we should get access to it
++	 * regardless (see "__alloc_pages()"). "kswapd" should
++	 * never get caught in the normal page freeing logic.
++	 *
++	 * (Kswapd normally doesn't need memory anyway, but sometimes
++	 * you need a small amount of memory in order to be able to
++	 * page out something else, and this flag essentially protects
++	 * us from recursively trying to free more memory as we're
++	 * trying to free the first piece of memory in the first place).
++	 */
++	pgdat = (pg_data_t *)p;
++
++	current->flags |= PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD;
++	set_freezable();
++
++	while (!kthread_should_stop()) {
++		wait_event_freezable(shrink_lruvec_wait,
++			(atomic_read(&shrink_lruvec_runnable) == 1));
++
++		set_shrink_lruvecd_cpus();
++retry_reclaim:
++
++		spin_lock_irq(&l_inactive_lock);
++		if (list_empty(&lru_inactive)) {
++			spin_unlock_irq(&l_inactive_lock);
++			atomic_set(&shrink_lruvec_runnable, 0);
++			continue;
++		}
++		list_for_each_entry_safe(page, next, &lru_inactive, lru) {
++			list_move(&page->lru, &tmp_lru_inactive);
++			shrink_lruvec_pages -= thp_nr_pages(page);
++			shrink_lruvec_handle_pages += thp_nr_pages(page);
++		}
++		spin_unlock_irq(&l_inactive_lock);
++
++		reclaim_pages(&tmp_lru_inactive);
++		goto retry_reclaim;
++	}
++	current->flags &= ~(PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD);
++
++	return 0;
++}
++
++static void page_trylock_set(void *data, struct page *page)
++{
++	if (unlikely(!async_shrink_lruvec_setup))
++		return;
++
++	ClearPageSkipedLock(page);
++
++	if (unlikely(process_is_shrink_lruvecd(current))) {
++		ClearPageNoLockDelay(page);
++		return;
++	}
++
++	SetPageNoLockDelay(page);
++}
++
++static void page_trylock_clear(void *data, struct page *page)
++{
++	ClearPageNoLockDelay(page);
++	ClearPageSkipedLock(page);
++}
++
++static void page_trylock_get_result(void *data, struct page *page, bool *trylock_fail)
++{
++	ClearPageNoLockDelay(page);
++
++	if (unlikely(!async_shrink_lruvec_setup) ||
++			unlikely(process_is_shrink_lruvecd(current))) {
++		*trylock_fail = false;
++		return;
++	}
++
++	if (PageSkipedLock(page))
++		*trylock_fail = true; /*page trylock failed and been skipped*/
++}
++
++static void do_page_trylock(void *data, struct page *page, struct rw_semaphore *sem,
++		bool *got_lock, bool *success)
++{
++	*success = false;
++	if (unlikely(!async_shrink_lruvec_setup))
++		return;
++
++	if (TestClearPageNoLockDelay(page)) {
++		*success = true;
++
++		if (sem == NULL)
++			return;
++
++		if (down_read_trylock(sem)) {   /* return 1 successful */
++			*got_lock = true;
++
++		} else {
++			SetPageSkipedLock(page);  /* trylock failed and skipped */
++			*got_lock = false;
++		}
++	}
++}
++static int kshrink_lruvecd_status_show(struct seq_file *m, void *arg)
++{
++	seq_printf(m,
++		   "kshrink_lruvecd_setup:     %s\n"
++		   "shrink_lruvec_pages:     %lu\n"
++		   "shrink_lruvec_handle_pages:     %lu\n"
++		   "shrink_lruvec_pages_max:     %lu\n",
++		   async_shrink_lruvec_setup ? "enable" : "disable",
++		   shrink_lruvec_pages,
++		   shrink_lruvec_handle_pages,
++		   shrink_lruvec_pages_max);
++	seq_putc(m, '\n');
++
++	return 0;
++}
++
++static int __init kshrink_lruvec_init(void)
++{
++	pg_data_t *pgdat = NODE_DATA(0);
++	int ret;
++
++	register_trace_android_vh_handle_failed_page_trylock(handle_failed_page_trylock, NULL);
++	register_trace_android_vh_page_trylock_set(page_trylock_set, NULL);
++	register_trace_android_vh_page_trylock_clear(page_trylock_clear, NULL);
++	register_trace_android_vh_page_trylock_get_result(page_trylock_get_result, NULL);
++	register_trace_android_vh_do_page_trylock(do_page_trylock, NULL);
++
++	init_waitqueue_head(&shrink_lruvec_wait);
++	spin_lock_init(&l_inactive_lock);
++
++	shrink_lruvec_tsk = kthread_run(shrink_lruvecd, pgdat, "kshrink_lruvecd");
++	if (IS_ERR_OR_NULL(shrink_lruvec_tsk)) {
++		pr_err("Failed to start shrink_lruvec on node 0\n");
++		ret = PTR_ERR(shrink_lruvec_tsk);
++		shrink_lruvec_tsk = NULL;
++		return ret;
++	}
++	proc_create_single("kshrink_lruvecd_status", 0, NULL, kshrink_lruvecd_status_show);
++	async_shrink_lruvec_setup = true;
++
++	printk(KERN_EMERG"async_shrink_lruvec_init !!!!\n");
++	return 0;
++}
++
++void kshrink_lruvec_exit(void)
++{
++	unregister_trace_android_vh_do_page_trylock(do_page_trylock, NULL);
++	unregister_trace_android_vh_page_trylock_get_result(page_trylock_get_result, NULL);
++	unregister_trace_android_vh_page_trylock_clear(page_trylock_clear, NULL);
++	unregister_trace_android_vh_page_trylock_set(page_trylock_set, NULL);
++	unregister_trace_android_vh_handle_failed_page_trylock(handle_failed_page_trylock, NULL);
++	remove_proc_entry("kshrink_lruvecd_status", NULL);
++}
++
++module_init(kshrink_lruvec_init);
++module_exit(kshrink_lruvec_exit);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/mm/async_reclaim_opt/kshrink_slabd.c b/mm/async_reclaim_opt/kshrink_slabd.c
+new file mode 100644
+index 000000000..cd4f3d71b
+--- /dev/null
++++ b/mm/async_reclaim_opt/kshrink_slabd.c
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2020-2022 Oplus. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "shrink_async: " fmt
++
++#include <linux/module.h>
++#include <trace/hooks/vmscan.h>
++#include <linux/swap.h>
++#include <linux/proc_fs.h>
++#include <linux/gfp.h>
++#include <linux/types.h>
++#include <linux/cpufreq.h>
++#include <linux/freezer.h>
++#include <linux/wait.h>
++#include <linux/memcontrol.h>
++#include <linux/mutex.h>
++
++#define SHRINK_SLABD_NAME "kshrink_slabd"
++extern unsigned long shrink_slab(gfp_t gfp_mask, int nid,
++				 struct mem_cgroup *memcg,
++				 int priority);
++
++static int kshrink_slabd_pid;
++static struct task_struct *shrink_slabd_tsk = NULL;
++static bool async_shrink_slabd_setup = false;
++
++wait_queue_head_t shrink_slabd_wait;
++
++struct async_slabd_parameter {
++	struct mem_cgroup *shrink_slabd_memcg;
++	gfp_t shrink_slabd_gfp_mask;
++	int shrink_slabd_runnable;
++	int shrink_slabd_nid;
++	int priority;
++	struct reclaim_state *reclaim_state;
++} asp;
++
++static struct reclaim_state async_reclaim_state = {
++		.reclaimed_slab = 0,
++};
++
++/* copy from mm/vmscan.c */
++static void set_task_reclaim_state(struct task_struct *task,
++				   struct reclaim_state *rs)
++{
++	/* Check for an overwrite */
++	WARN_ON_ONCE(rs && task->reclaim_state);
++
++	/* Check for the nulling of an already-nulled member */
++	WARN_ON_ONCE(!rs && !task->reclaim_state);
++
++	task->reclaim_state = rs;
++}
++
++static DEFINE_MUTEX(async_shrink_slab_mutex);
++
++static bool is_shrink_slabd_task(struct task_struct *tsk)
++{
++	return tsk->pid == kshrink_slabd_pid;
++}
++
++bool wakeup_shrink_slabd(gfp_t gfp_mask, int nid,
++				 struct mem_cgroup *memcg,
++				 int priority)
++{
++	if (unlikely(!async_shrink_slabd_setup))
++		return false;
++
++	if (!mutex_trylock(&async_shrink_slab_mutex))
++		return true;
++
++	if (asp.shrink_slabd_runnable == 1) {
++		mutex_unlock(&async_shrink_slab_mutex);
++		return true;
++	}
++	async_reclaim_state.reclaimed_slab = 0;
++	asp.reclaim_state = &async_reclaim_state;
++	asp.shrink_slabd_gfp_mask = gfp_mask;
++	asp.shrink_slabd_nid = nid;
++	asp.shrink_slabd_memcg = memcg;
++	asp.priority = priority;
++	asp.shrink_slabd_runnable = 1;
++	css_get(&memcg->css);
++	mutex_unlock(&async_shrink_slab_mutex);
++
++	wake_up_interruptible(&shrink_slabd_wait);
++	return true;
++}
++
++void set_async_slabd_cpus(void)
++{
++	struct cpumask mask;
++	struct cpumask *cpumask = &mask;
++	pg_data_t *pgdat = NODE_DATA(0);
++	unsigned int cpu = 0, cpufreq_max_tmp = 0;
++	struct cpufreq_policy *policy_max;
++	static bool set_slabd_cpus_success = false;
++
++	if (unlikely(!async_shrink_slabd_setup))
++		return;
++
++	if (likely(set_slabd_cpus_success))
++		return;
++	for_each_possible_cpu(cpu) {
++		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++
++		if (policy == NULL)
++			continue;
++
++		if (policy->cpuinfo.max_freq >= cpufreq_max_tmp) {
++			cpufreq_max_tmp = policy->cpuinfo.max_freq;
++			policy_max = policy;
++		}
++	}
++
++	cpumask_copy(cpumask, cpumask_of_node(pgdat->node_id));
++	cpumask_andnot(cpumask, cpumask, policy_max->related_cpus);
++
++	if (!cpumask_empty(cpumask)) {
++		set_cpus_allowed_ptr(shrink_slabd_tsk, cpumask);
++		set_slabd_cpus_success = true;
++	}
++}
++
++static int kshrink_slabd_func(void *p)
++{
++	struct mem_cgroup *memcg;
++	gfp_t gfp_mask;
++	int nid, priority;
++	/*
++	 * Tell the memory management that we're a "memory allocator",
++	 * and that if we need more memory we should get access to it
++	 * regardless (see "__alloc_pages()"). "kswapd" should
++	 * never get caught in the normal page freeing logic.
++	 *
++	 * (Kswapd normally doesn't need memory anyway, but sometimes
++	 * you need a small amount of memory in order to be able to
++	 * page out something else, and this flag essentially protects
++	 * us from recursively trying to free more memory as we're
++	 * trying to free the first piece of memory in the first place).
++	 */
++	current->flags |= PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD;
++	set_freezable();
++
++	asp.reclaim_state = NULL;
++	asp.shrink_slabd_gfp_mask = 0;
++	asp.shrink_slabd_nid = 0;
++	asp.shrink_slabd_memcg = NULL;
++	asp.shrink_slabd_runnable = 0;
++	asp.priority = 0;
++
++	while (!kthread_should_stop()) {
++		wait_event_freezable(shrink_slabd_wait, asp.shrink_slabd_runnable == 1);
++
++		set_async_slabd_cpus();
++
++		mutex_lock(&async_shrink_slab_mutex);
++		set_task_reclaim_state(current, asp.reclaim_state);
++		nid = asp.shrink_slabd_nid;
++		gfp_mask = asp.shrink_slabd_gfp_mask;
++		priority = asp.priority;
++		memcg = asp.shrink_slabd_memcg;
++		asp.shrink_slabd_runnable = 0;
++		mutex_unlock(&async_shrink_slab_mutex);
++
++		shrink_slab(gfp_mask, nid, memcg, priority);
++		css_put(&memcg->css);
++		set_task_reclaim_state(current, NULL);
++	}
++	current->flags &= ~(PF_MEMALLOC | PF_SWAPWRITE | PF_KSWAPD);
++	current->reclaim_state = NULL;
++
++	return 0;
++}
++
++void should_shrink_async(void *data, gfp_t gfp_mask, int nid,
++			struct mem_cgroup *memcg, int priority, bool *bypass)
++{
++	if (unlikely(!async_shrink_slabd_setup)) {
++		*bypass = false;
++		return;
++	}
++
++	if (is_shrink_slabd_task(current)) {
++		*bypass = false;
++	} else {
++		*bypass = wakeup_shrink_slabd(gfp_mask, nid, memcg, priority);
++	}
++}
++EXPORT_SYMBOL_GPL(should_shrink_async);
++
++static int register_shrink_async_vendor_hooks(void)
++{
++	int ret = 0;
++
++	ret = register_trace_android_vh_shrink_slab_bypass(should_shrink_async, NULL);
++	if (ret != 0)
++		pr_err("register_trace_android_vh_shrink_slab_bypass failed! ret=%d\n", ret);
++	return ret;
++}
++
++static void unregister_shrink_async_vendor_hooks(void)
++{
++	unregister_trace_android_vh_shrink_slab_bypass(should_shrink_async, NULL);
++}
++
++static int __init shrink_async_init(void)
++{
++	int ret = 0;
++
++	ret = register_shrink_async_vendor_hooks();
++	if (ret != 0)
++		return ret;
++
++	init_waitqueue_head(&shrink_slabd_wait);
++
++	shrink_slabd_tsk = kthread_run(kshrink_slabd_func, NULL, SHRINK_SLABD_NAME);
++	if (IS_ERR_OR_NULL(shrink_slabd_tsk)) {
++		pr_err("Failed to start shrink_slabd on node 0\n");
++		ret = PTR_ERR(shrink_slabd_tsk);
++		shrink_slabd_tsk = NULL;
++		unregister_shrink_async_vendor_hooks();
++		return ret;
++	}
++
++	kshrink_slabd_pid = shrink_slabd_tsk->pid;
++	async_shrink_slabd_setup = true;
++
++	pr_info("kshrink_async succeed!\n");
++	return 0;
++}
++
++static void __exit shrink_async_exit(void)
++{
++	unregister_shrink_async_vendor_hooks();
++
++	pr_info("shrink_async exit succeed!\n");
++
++	return;
++}
++
++module_init(shrink_async_init);
++module_exit(shrink_async_exit);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/mm/async_reclaim_opt/pcppages_opt.c b/mm/async_reclaim_opt/pcppages_opt.c
+new file mode 100644
+index 000000000..48cfa5d0f
+--- /dev/null
++++ b/mm/async_reclaim_opt/pcppages_opt.c
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2020-2022 Oplus. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "dstate_opt: " fmt
++
++#include <linux/module.h>
++#include <trace/hooks/vmscan.h>
++#include <trace/hooks/mm.h>
++#include <linux/swap.h>
++#include <linux/proc_fs.h>
++#include <linux/gfp.h>
++#include <linux/types.h>
++#include <linux/printk.h>
++
++static void should_drain_all_pages(void *data, gfp_t gfp_mask, unsigned int order, unsigned long alloc_flags,
++					int migratetype, unsigned long did_some_progress, bool *bypass)
++{
++	*bypass = true;
++}
++
++
++static int register_dstate_opt_vendor_hooks(void)
++{
++	int ret = 0;
++
++	ret = register_trace_android_vh_drain_all_pages_bypass(should_drain_all_pages, NULL);
++	if (ret != 0) {
++		pr_err("register_dstate_opt_vendor_hooks failed! ret=%d\n", ret);
++		goto out;
++	}
++
++out:
++	return ret;
++}
++
++static void unregister_dstate_opt_vendor_hooks(void)
++{
++	unregister_trace_android_vh_drain_all_pages_bypass(should_drain_all_pages, NULL);
++
++	return;
++}
++
++static int __init pcppages_opt_init(void)
++{
++	int ret = 0;
++
++	ret = register_dstate_opt_vendor_hooks();
++	if (ret != 0)
++		return ret;
++
++	pr_info("dstate_opt_init succeed!\n");
++	return 0;
++}
++
++static void __exit pcppages_opt_exit(void)
++{
++	unregister_dstate_opt_vendor_hooks();
++
++	pr_info("dstate_opt_exit exit succeed!\n");
++
++	return;
++}
++
++module_init(pcppages_opt_init);
++module_exit(pcppages_opt_exit);
++
++MODULE_LICENSE("GPL v2");
