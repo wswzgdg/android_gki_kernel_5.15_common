@@ -18,17 +18,39 @@ prepare() {
     [ -e "$patch" ] && git -C "$WORKTREE" apply "$patch"
   done
   sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' "$WORKTREE/Makefile"
+  : > "$WORKTREE/.scmversion"
   export KBUILD_BUILD_USER='ZakoBai♡'
   export KBUILD_BUILD_HOST='XinRan'
 }
 
+pick_bin() {
+  for bin in "$@"; do
+    command -v "$bin" >/dev/null 2>&1 && {
+      printf '%s' "$bin"
+      return 0
+    }
+  done
+  return 1
+}
+
 make_cmd() {
+  local cc hostcxx ld ar nm objcopy objdump strip readelf
+  cc="$(pick_bin clang-23 clang-22 clang-21 clang)"
+  hostcxx="$(pick_bin clang++-23 clang++-22 clang++-21 clang++)"
+  ld="$(pick_bin ld.bfd ld.lld ld)"
+  ar="$(pick_bin llvm-ar-23 llvm-ar)"
+  nm="$(pick_bin llvm-nm-23 llvm-nm)"
+  objcopy="$(pick_bin llvm-objcopy-23 llvm-objcopy)"
+  objdump="$(pick_bin llvm-objdump-23 llvm-objdump)"
+  strip="$(pick_bin llvm-strip-23 llvm-strip)"
+  readelf="$(pick_bin llvm-readelf-23 llvm-readelf)"
+
   make -C "$WORKTREE" O="$OUT_DIR" \
     ARCH=arm64 LLVM=0 LLVM_IAS=1 \
-    CC=clang-23 HOSTCC=clang-23 HOSTCXX=clang++-23 \
-    LD=ld.bfd HOSTLD=ld.bfd \
-    AR=llvm-ar-23 NM=llvm-nm-23 OBJCOPY=llvm-objcopy-23 OBJDUMP=llvm-objdump-23 \
-    STRIP=llvm-strip-23 READELF=llvm-readelf-23 \
+    CC="$cc" HOSTCC="$cc" HOSTCXX="$hostcxx" \
+    LD="$ld" HOSTLD="$ld" \
+    AR="$ar" NM="$nm" OBJCOPY="$objcopy" OBJDUMP="$objdump" \
+    STRIP="$strip" READELF="$readelf" \
     KCFLAGS=-Wno-error HOSTCFLAGS=-Wno-error \
     "$@"
 }
