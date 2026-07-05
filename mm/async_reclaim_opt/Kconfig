@@ -1,0 +1,28 @@
+menu "Async reclaim optimizations"
+
+config ABORT_MM_OPT
+	tristate "Abort madvise/compact on SIGUSR2"
+	help
+	  Aborts long madvise cold/pageout and compaction work when the current
+	  task receives SIGUSR2.
+
+config KSHRINK_LRUVECD
+	tristate "Async lruvec reclaim helper"
+	depends on MMU
+	help
+	  Collects pages that failed page_trylock during reclaim and reclaims them
+	  asynchronously from a dedicated kernel thread.
+
+config KSHRINK_SLABD
+	tristate "Async slab shrink helper"
+	depends on MEMCG
+	help
+	  Offloads shrink_slab() from direct reclaim into a dedicated kernel thread.
+
+config PCPPAGES_OPT
+	tristate "Bypass drain_all_pages in reclaim path"
+	help
+	  Bypasses the global per-cpu page drain hook. This reduces latency but may
+	  trade off reclaim aggressiveness in some workloads.
+
+endmenu

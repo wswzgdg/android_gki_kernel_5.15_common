@@ -971,3 +971,5 @@ config SPECULATIVE_PAGE_FAULT
 	  processing using the mmap read lock.
 
 endmenu
+
+source "mm/async_reclaim_opt/Kconfig"
