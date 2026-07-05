@@ -35,6 +35,9 @@
 #include <linux/tracehook.h>
 #include <linux/capability.h>
 #include <linux/freezer.h>
+#ifdef CONFIG_REKERNEL
+#include "../drivers/rekernel/rekernel.h"
+#endif /* CONFIG_REKERNEL */
 #include <linux/pid_namespace.h>
 #include <linux/nsproxy.h>
 #include <linux/user_namespace.h>
@@ -1298,6 +1301,11 @@ int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p
 {
 	unsigned long flags;
 	int ret = -ESRCH;
+#ifdef CONFIG_REKERNEL
+	if (sig == SIGKILL || sig == SIGTERM || sig == SIGABRT || sig == SIGQUIT)
+		rekernel_report(SIGNAL, sig, task_tgid_nr(current), current,
+				 task_tgid_nr(p), p, false, NULL);
+#endif /* CONFIG_REKERNEL */
 	trace_android_vh_do_send_sig_info(sig, current, p);
 	if (lock_task_sighand(p, &flags)) {
 		ret = send_signal(sig, info, p, type);
