@@ -9,14 +9,6 @@ clang -v
 clang++ -v
 git -v
 
-git fetch origin
-git reset --hard "origin/$(git branch --show-current)"
-git clean -fd
-
-for p in patch/*.patch; do
-  [ -e "$p" ] && git apply "$p"
-done
-
 touch .scmversion
 sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
 
